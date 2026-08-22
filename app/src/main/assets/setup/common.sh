@@ -11,13 +11,14 @@ BERNS_DISPLAY="${BERNS_DISPLAY:-1}"
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 warn() { printf '\033[1;33m    ! %s\033[0m\n' "$*"; }
+die()  { printf '\033[1;31m!!  %s\033[0m\n' "$*" >&2; exit 1; }
 
 apt_get() {
     apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=false "$@"
 }
 
 install_pkgs() {
-    apt_get install -y --no-install-recommends "$@"
+    apt_get install -y --no-install-recommends "$@" || die "could not install: $*"
 }
 
 # Best effort: a missing optional package should not fail the whole install.
@@ -48,7 +49,7 @@ path-exclude=/usr/share/man/*
 path-exclude=/usr/share/groff/*
 path-exclude=/usr/share/info/*
 EOF
-    apt_get update
+    apt_get update || die "apt-get update failed - check the network and try again"
 }
 
 install_base() {
@@ -73,7 +74,9 @@ install_desktop() {
 
 install_vnc() {
     step "Installing the VNC server"
-    install_pkgs tigervnc-standalone-server tigervnc-common
+    # Ubuntu 24.04 splits the password tool out into tigervnc-tools; without it there is
+    # no vncpasswd and Xvnc has nothing to authenticate against.
+    install_pkgs tigervnc-standalone-server tigervnc-common tigervnc-tools
 }
 
 create_user() {
@@ -93,7 +96,16 @@ configure_vnc() {
     local home="/home/$BERNS_USER"
     mkdir -p "$home/.vnc"
 
-    printf '%s\n' "$BERNS_VNC_PASS" | vncpasswd -f > "$home/.vnc/passwd"
+    local vncpasswd_bin=""
+    for candidate in vncpasswd tigervncpasswd; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            vncpasswd_bin="$candidate"
+            break
+        fi
+    done
+    [ -n "$vncpasswd_bin" ] || die "no vncpasswd tool found - tigervnc-tools did not install"
+    printf '%s\n' "$BERNS_VNC_PASS" | "$vncpasswd_bin" -f > "$home/.vnc/passwd"
+    [ -s "$home/.vnc/passwd" ] || die "could not write the VNC password file"
     chmod 600 "$home/.vnc/passwd"
 
     cat > "$home/.vnc/xstartup" <<'EOF'
@@ -119,6 +131,8 @@ Xft.rgba: rgb
 EOF
 
     chown -R "$BERNS_USER:$BERNS_USER" "$home/.vnc" "$home/.Xresources"
+
+    command -v Xvnc >/dev/null 2>&1 || die "Xvnc is missing - the VNC server did not install"
 
     # The launcher the app calls. Xvnc is started directly rather than through the
     # vncserver wrapper, which expects a session manager the container does not have.
@@ -302,11 +316,11 @@ EOF
 
 # A tiny /etc/os-release-style banner so the container announces which port it is.
 brand_release() {
-    local name="$1" pretty="$2" idlike="$3" home_url="$4"
+    local name="$1" pretty="$2" base_family="$3" home_url="$4"
     cat > /etc/berns-release <<EOF
 BERNS_PORT_NAME="$name"
 BERNS_PORT_PRETTY="$pretty"
-BERNS_BASE="Ubuntu 24.04 LTS (noble)"
+BERNS_BASE="Ubuntu 24.04 LTS (noble), $base_family family"
 BERNS_HOME_URL="$home_url"
 EOF
     cat > /etc/motd <<EOF
@@ -318,8 +332,6 @@ EOF
   Docs:     cat /etc/berns-release   Distro home:   $home_url
 
 EOF
-    ID_LIKE="$idlike"
-    export ID_LIKE
 }
 
 finish_setup() {

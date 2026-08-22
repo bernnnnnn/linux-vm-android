@@ -120,6 +120,35 @@ service/ ─ VmService                foreground service so sessions survive bac
 assets/setup/ ─ common.sh + one script per port
 ```
 
+## What has been verified, and what hasn't
+
+Being straight about this, because "it builds" and "it works" are different claims.
+
+**Verified:**
+
+- The APK builds clean for `arm64-v8a`, `armeabi-v7a` and `x86_64`, native layer included,
+  and ships the proot runtime unstripped and byte-identical to what `fetch-prebuilts.sh`
+  staged.
+- The whole install path was run for real against an Ubuntu 24.04 root filesystem: apt
+  configuration, the desktop and VNC package sets, user creation, and the Mint artwork
+  fetched live from `packages.linuxmint.com` — genuine Mint-Y-Dark-Aqua, Mint-Y-Aqua icons
+  and a real Mint wallpaper, all resolved through the vendor index.
+- `berns-desktop` starts Xvnc and a working Xfce session (`xfce4-session`, `xfconfd`,
+  `xfce4-panel` and its plugins all come up).
+- The RFB conversation was replayed byte for byte against that running Xvnc: version
+  handshake, VncAuth with the bit-reversed DES key, the exact pixel format and encoding
+  list this client sends, 18 Hextile rectangles decoded without desync, and pointer and
+  key events accepted.
+
+That run found two real bugs, both fixed: Ubuntu 24.04 moved `vncpasswd` into
+`tigervnc-tools` (so the password file was silently never written), and Mint's wallpaper
+package is named after an older release than the suite serving it.
+
+**Not verified:** none of this has run on an actual Android device. proot's ptrace sandbox,
+the `jniLibs` exec path, the JNI pty and the Compose UI were all built against the
+documented behaviour but never executed on a phone. Expect the first run on real hardware
+to need a fix or two — that is where the remaining risk lives.
+
 ## Known limits
 
 - Anything needing a real kernel — `mount`, kernel modules, Docker, nested virtualisation —

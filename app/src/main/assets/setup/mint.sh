@@ -29,7 +29,7 @@ if [ -n "$MINT_CODENAME" ]; then
         mint-x-icons mint-y-icons mint-themes; then
         MINT_OK=1
     fi
-    WALLPAPER_PKG="$(newest_all_package "$MINT_REPO" "$MINT_CODENAME" "main" "mint-backgrounds-")"
+    WALLPAPER_PKG="$(newest_all_package "$MINT_REPO" "$MINT_CODENAME" "main" "mint-backgrounds-" || true)"
     if [ -n "$WALLPAPER_PKG" ]; then
         info "wallpapers: $WALLPAPER_PKG"
         install_all_deb "$MINT_REPO" "$MINT_CODENAME" "main" "$WALLPAPER_PKG" || \

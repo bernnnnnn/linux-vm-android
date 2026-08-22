@@ -45,6 +45,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
@@ -56,7 +57,6 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
-import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextRange
@@ -64,6 +64,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.berns.linuxports.core.DesktopState
@@ -226,11 +227,25 @@ private fun RemoteScreen(client: RfbClient) {
 
     var scale by remember { mutableStateOf(0f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
-    var viewport by remember { mutableStateOf(Offset.Zero) }
+    var viewport by remember { mutableStateOf(IntSize.Zero) }
+
+    // Fit the remote screen to the view whenever either of them changes. This has to
+    // happen outside the draw phase - writing Compose state while drawing invalidates
+    // the frame that is being drawn.
+    LaunchedEffect(viewport, size) {
+        val (remoteW, remoteH) = size
+        if (remoteW <= 0 || remoteH <= 0 || viewport.width == 0 || viewport.height == 0) return@LaunchedEffect
+        scale = min(viewport.width.toFloat() / remoteW, viewport.height.toFloat() / remoteH)
+        offset = Offset(
+            (viewport.width - remoteW * scale) / 2f,
+            max(0f, (viewport.height - remoteH * scale) / 2f)
+        )
+    }
 
     Canvas(
         modifier = Modifier
             .fillMaxSize()
+            .onSizeChanged { viewport = it }
             .pointerInput(client, size) {
                 awaitEachGesture {
                     val first = awaitFirstDown(requireUnconsumed = false)
@@ -239,7 +254,6 @@ private fun RemoteScreen(client: RfbClient) {
                     var lastDistance = 0f
                     var moved = false
                     val startScale = scale
-                    val tracker = VelocityTracker()
 
                     fun toRemote(p: Offset): Pair<Int, Int> {
                         val s = if (scale <= 0f) 1f else scale
@@ -282,7 +296,6 @@ private fun RemoteScreen(client: RfbClient) {
                                 lastCentroid = change.position
                                 val (mx, my) = toRemote(change.position)
                                 client.sendPointer(mx, my, 1)
-                                tracker.addPosition(change.uptimeMillis, change.position)
                             }
                             change.consume()
                         } else {
@@ -302,17 +315,7 @@ private fun RemoteScreen(client: RfbClient) {
                 }
             }
     ) {
-        val (remoteW, remoteH) = size
-        if (remoteW <= 0 || remoteH <= 0) return@Canvas
-        if (scale <= 0f || viewport != Offset(this.size.width, this.size.height)) {
-            viewport = Offset(this.size.width, this.size.height)
-            scale = min(this.size.width / remoteW, this.size.height / remoteH)
-            offset = Offset(
-                (this.size.width - remoteW * scale) / 2f,
-                max(0f, (this.size.height - remoteH * scale) / 2f)
-            )
-        }
-
+        if (scale <= 0f) return@Canvas
         drawIntoCanvas { canvas ->
             val native = canvas.nativeCanvas
             native.drawColor(0xFF05080A.toInt())
