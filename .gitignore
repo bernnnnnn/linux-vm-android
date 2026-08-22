@@ -10,6 +10,7 @@ captures/
 *.apk
 *.aab
 *.keystore
+!keystore/berns-debug.keystore
 app/src/main/jniLibs/*/
 !app/src/main/jniLibs/.gitkeep
 prebuilts/

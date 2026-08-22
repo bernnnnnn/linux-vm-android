@@ -85,14 +85,37 @@ that is both read-only and executable. `PRoot.ensureShims()` then symlinks the r
 
 CI builds a debug APK on every push; grab it from the workflow artifacts.
 
+### Updating without losing your container
+
+Installing a port takes a long download and a real `apt` install, so updates must never
+cost you that. The rootfs lives in the app's private data directory, which Android keeps
+across an in-place update — but only when the new APK carries the *same signature*. A debug
+build normally uses a per-machine throwaway key, so a rebuild elsewhere would be treated as
+a different app and force an uninstall.
+
+`keystore/berns-debug.keystore` is therefore committed and pinned in `app/build.gradle.kts`,
+so every build anywhere signs identically and installs straight over the last one. It is the
+stock Android debug keystore with its published password — not a secret, and not to be used
+for a release build.
+
 ## Using it
 
 1. Pick a port and press **Install**. It downloads ~30 MB of base image, then runs a real
    `apt` install of the desktop — budget several hundred MB and 10–30 minutes on the first
    run, on Wi-Fi. The build log streams live and survives leaving the screen.
 2. Press **Open desktop**. The first launch is the slow one while Xfce builds its caches.
-3. One finger is the mouse — tap to click, drag to drag. Two fingers pan and pinch-zoom.
-   The bar along the bottom carries Ctrl, Alt, Esc, Tab and the arrows.
+3. Drive the desktop with whichever pointer mode suits you — the button in the toolbar
+   cycles between them, and the one next to it cycles pointer speed:
+
+   | Mode | How it works |
+   |---|---|
+   | **Trackpad** (default) | Drag anywhere to move the cursor relatively, like a laptop touchpad. Tap to click. Best on a phone, because your finger never covers the thing you are aiming at. |
+   | **Touch** | The cursor jumps to wherever you touch, and touching presses the left button. Direct, but your fingertip hides the target. |
+   | **Stick** | An on-screen thumbstick in the corner steers the cursor continuously. Slowest, but the most precise for small targets. |
+
+   Two fingers scroll when the screen is fit to the view, and pan once you pinch-zoom in.
+   The bar along the bottom has the mouse buttons, a latching **DRAG** toggle for moving
+   windows, scroll, and Ctrl/Alt/Esc/Tab/arrows.
 4. **Open terminal** gives you `bash` as the `berns` user, with passwordless `sudo`.
 
 Files in `/mnt/android` inside the container are shared with the app's own storage, so it's

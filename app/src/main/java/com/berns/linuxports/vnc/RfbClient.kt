@@ -21,6 +21,11 @@ import kotlin.concurrent.thread
  *
  * Everything travels over 127.0.0.1 inside the phone, so there is no point paying for
  * Tight/ZRLE compression - raw pixels over loopback are cheaper than decoding them.
+ *
+ * Input never touches the socket from the caller's thread. Android kills any network I/O
+ * on the main thread, so pointer and key events go into an outbox that a writer thread
+ * drains; the outbox also collapses runs of pointer motion, which is what stops a finger
+ * drag from queueing hundreds of stale positions.
  */
 class RfbClient(
     private val host: String = "127.0.0.1",
@@ -34,6 +39,7 @@ class RfbClient(
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
     private val _frame = MutableStateFlow(0L)
+
     /** Increments on every applied framebuffer update, so the UI knows to redraw. */
     val frame: StateFlow<Long> = _frame.asStateFlow()
     private val _size = MutableStateFlow(0 to 0)
@@ -43,7 +49,6 @@ class RfbClient(
         private set
 
     private var socket: Socket? = null
-    private var input: DataInputStream? = null
     private var output: DataOutputStream? = null
 
     private val bitmapLock = Any()
@@ -51,8 +56,15 @@ class RfbClient(
     private var width = 0
     private var height = 0
 
+    private val outbox = Outbox()
+    private var writer: Thread? = null
+
     @Volatile private var running = false
     @Volatile private var pendingRequest = false
+
+    // Reused across rectangles so decoding a frame does not allocate megabytes.
+    private var rectBuf = IntArray(0)
+    private var byteBuf = ByteArray(1 shl 16)
 
     fun connect() {
         if (running) return
@@ -68,6 +80,7 @@ class RfbClient(
                 }
             } finally {
                 running = false
+                outbox.close()
                 if (_status.value == Status.CONNECTED) _status.value = Status.DISCONNECTED
                 closeQuietly()
             }
@@ -77,7 +90,10 @@ class RfbClient(
     fun disconnect() {
         running = false
         _status.value = Status.DISCONNECTED
-        closeQuietly()
+        outbox.close()
+        // Closing a socket is still socket work, and disconnect() is called from the UI
+        // thread when the screen goes away. Do it somewhere Android is happy about.
+        thread(name = "berns-vnc-close", isDaemon = true) { closeQuietly() }
     }
 
     /** Runs [block] with the current framebuffer; returns null while there is none yet. */
@@ -88,8 +104,9 @@ class RfbClient(
     private fun closeQuietly() {
         runCatching { socket?.close() }
         socket = null
-        input = null
         output = null
+        writer?.interrupt()
+        writer = null
     }
 
     // ------------------------------------------------------------- handshake
@@ -101,7 +118,6 @@ class RfbClient(
         socket = s
         val inp = DataInputStream(BufferedInputStream(s.getInputStream(), 1 shl 16))
         val out = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 1 shl 15))
-        input = inp
         output = out
 
         // ProtocolVersion
@@ -153,15 +169,17 @@ class RfbClient(
         _size.value = width to height
         sendPixelFormat(out)
         sendEncodings(out)
+
+        // From here on every outbound byte goes through the writer thread.
+        startWriter(out)
         _status.value = Status.CONNECTED
         requestUpdate(false)
 
-        val buffer = ByteArray(1 shl 18)
         while (running) {
             when (val msg = inp.read()) {
                 -1 -> throw IOException("server closed the connection")
                 0 -> {
-                    handleFramebufferUpdate(inp, buffer)
+                    handleFramebufferUpdate(inp)
                     pendingRequest = false
                     requestUpdate(true)
                 }
@@ -177,6 +195,25 @@ class RfbClient(
                     inp.skipBytes(len)
                 }
                 else -> throw IOException("unexpected server message $msg")
+            }
+        }
+    }
+
+    private fun startWriter(out: DataOutputStream) {
+        writer = thread(name = "berns-vnc-out", isDaemon = true) {
+            try {
+                while (running) {
+                    val first = outbox.take() ?: break
+                    out.write(first)
+                    // Drain anything else that piled up before paying for a flush.
+                    while (true) {
+                        val more = outbox.poll() ?: break
+                        out.write(more)
+                    }
+                    out.flush()
+                }
+            } catch (e: Throwable) {
+                if (running) _error.value = "input channel failed: ${e.message}"
             }
         }
     }
@@ -230,14 +267,12 @@ class RfbClient(
 
     private fun requestUpdate(incremental: Boolean) {
         if (pendingRequest) return
-        val out = output ?: return
-        synchronized(out) {
-            out.writeByte(3)
-            out.writeByte(if (incremental) 1 else 0)
-            out.writeShort(0); out.writeShort(0)
-            out.writeShort(width); out.writeShort(height)
-            out.flush()
-        }
+        val msg = ByteArray(10)
+        msg[0] = 3
+        msg[1] = if (incremental) 1 else 0
+        putShort(msg, 2, 0); putShort(msg, 4, 0)
+        putShort(msg, 6, width); putShort(msg, 8, height)
+        outbox.offer(msg, motion = false)
         pendingRequest = true
     }
 
@@ -250,7 +285,17 @@ class RfbClient(
 
     // ------------------------------------------------------------- decoding
 
-    private fun handleFramebufferUpdate(inp: DataInputStream, scratch: ByteArray) {
+    private fun ensureRect(size: Int): IntArray {
+        if (rectBuf.size < size) rectBuf = IntArray(size)
+        return rectBuf
+    }
+
+    private fun ensureBytes(size: Int): ByteArray {
+        if (byteBuf.size < size) byteBuf = ByteArray(size)
+        return byteBuf
+    }
+
+    private fun handleFramebufferUpdate(inp: DataInputStream) {
         inp.skipBytes(1)
         val rects = inp.readUnsignedShort()
         for (i in 0 until rects) {
@@ -259,7 +304,7 @@ class RfbClient(
             val w = inp.readUnsignedShort()
             val h = inp.readUnsignedShort()
             when (val encoding = inp.readInt()) {
-                ENC_RAW -> decodeRaw(inp, x, y, w, h, scratch)
+                ENC_RAW -> decodeRaw(inp, x, y, w, h)
                 ENC_COPYRECT -> decodeCopyRect(inp, x, y, w, h)
                 ENC_RRE -> decodeRre(inp, x, y, w, h)
                 ENC_HEXTILE -> decodeHextile(inp, x, y, w, h)
@@ -277,20 +322,19 @@ class RfbClient(
         _frame.value = _frame.value + 1
     }
 
-    private fun readPixels(inp: DataInputStream, count: Int, scratch: ByteArray): IntArray {
+    /** Reads [count] pixels into [dest] starting at [offset]. */
+    private fun readPixels(inp: DataInputStream, count: Int, dest: IntArray, offset: Int) {
         val bytes = count * 4
-        val buf = if (scratch.size >= bytes) scratch else ByteArray(bytes)
+        val buf = ensureBytes(bytes)
         inp.readFully(buf, 0, bytes)
-        val out = IntArray(count)
         var p = 0
         for (i in 0 until count) {
-            val b = buf[p].toInt() and 0xFF
-            val g = buf[p + 1].toInt() and 0xFF
-            val r = buf[p + 2].toInt() and 0xFF
-            out[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            dest[offset + i] = (0xFF shl 24) or
+                ((buf[p + 2].toInt() and 0xFF) shl 16) or
+                ((buf[p + 1].toInt() and 0xFF) shl 8) or
+                (buf[p].toInt() and 0xFF)
             p += 4
         }
-        return out
     }
 
     private fun readPixel(inp: DataInputStream): Int {
@@ -305,26 +349,16 @@ class RfbClient(
         if (w <= 0 || h <= 0) return
         synchronized(bitmapLock) {
             val bm = bitmap ?: return
-            if (x + w > bm.width || y + h > bm.height) return
+            if (x < 0 || y < 0 || x + w > bm.width || y + h > bm.height) return
             bm.setPixels(pixels, 0, w, x, y, w, h)
         }
     }
 
-    private fun fill(color: Int, x: Int, y: Int, w: Int, h: Int) {
-        if (w <= 0 || h <= 0) return
-        blit(IntArray(w * h) { color }, x, y, w, h)
-    }
-
-    private fun decodeRaw(inp: DataInputStream, x: Int, y: Int, w: Int, h: Int, scratch: ByteArray) {
-        // Read row by row so a full-screen update does not need a 8 MB scratch buffer.
-        val rowsPerChunk = (scratch.size / 4 / w.coerceAtLeast(1)).coerceIn(1, h.coerceAtLeast(1))
-        var row = 0
-        while (row < h) {
-            val chunk = minOf(rowsPerChunk, h - row)
-            val pixels = readPixels(inp, w * chunk, scratch)
-            blit(pixels, x, y + row, w, chunk)
-            row += chunk
-        }
+    private fun decodeRaw(inp: DataInputStream, x: Int, y: Int, w: Int, h: Int) {
+        // One rectangle, one buffer, one blit - a full-screen update is a single setPixels.
+        val buf = ensureRect(w * h)
+        readPixels(inp, w * h, buf, 0)
+        blit(buf, x, y, w, h)
     }
 
     private fun decodeCopyRect(inp: DataInputStream, x: Int, y: Int, w: Int, h: Int) {
@@ -333,29 +367,44 @@ class RfbClient(
         synchronized(bitmapLock) {
             val bm = bitmap ?: return
             if (srcX + w > bm.width || srcY + h > bm.height || x + w > bm.width || y + h > bm.height) return
-            val pixels = IntArray(w * h)
-            bm.getPixels(pixels, 0, w, srcX, srcY, w, h)
-            bm.setPixels(pixels, 0, w, x, y, w, h)
+            val buf = ensureRect(w * h)
+            bm.getPixels(buf, 0, w, srcX, srcY, w, h)
+            bm.setPixels(buf, 0, w, x, y, w, h)
+        }
+    }
+
+    private fun fillRect(buf: IntArray, stride: Int, x: Int, y: Int, w: Int, h: Int, color: Int, maxW: Int, maxH: Int) {
+        val x1 = minOf(x + w, maxW)
+        val y1 = minOf(y + h, maxH)
+        for (row in maxOf(y, 0) until y1) {
+            val base = row * stride
+            java.util.Arrays.fill(buf, base + maxOf(x, 0), base + x1, color)
         }
     }
 
     private fun decodeRre(inp: DataInputStream, x: Int, y: Int, w: Int, h: Int) {
         val subrects = inp.readInt()
-        fill(readPixel(inp), x, y, w, h)
+        val buf = ensureRect(w * h)
+        val background = readPixel(inp)
+        java.util.Arrays.fill(buf, 0, w * h, background)
         for (i in 0 until subrects) {
             val color = readPixel(inp)
             val sx = inp.readUnsignedShort()
             val sy = inp.readUnsignedShort()
             val sw = inp.readUnsignedShort()
             val sh = inp.readUnsignedShort()
-            fill(color, x + sx, y + sy, sw, sh)
+            fillRect(buf, w, sx, sy, sw, sh, color, w, h)
         }
+        blit(buf, x, y, w, h)
     }
 
     private fun decodeHextile(inp: DataInputStream, x: Int, y: Int, w: Int, h: Int) {
         var background = 0
         var foreground = 0
-        val scratch = ByteArray(16 * 16 * 4)
+        // The whole rectangle is assembled in one buffer; a 1280x720 frame used to cost
+        // ~3600 separate setPixels calls, which is what made the desktop feel frozen.
+        val buf = ensureRect(w * h)
+        val tile = IntArray(16 * 16)
 
         var ty = 0
         while (ty < h) {
@@ -366,15 +415,15 @@ class RfbClient(
                 val subencoding = inp.readUnsignedByte()
 
                 if (subencoding and HEXTILE_RAW != 0) {
-                    val pixels = readPixels(inp, tw * th, scratch)
-                    blit(pixels, x + tx, y + ty, tw, th)
+                    readPixels(inp, tw * th, tile, 0)
+                    copyTile(tile, tw, buf, w, tx, ty, tw, th)
                     tx += 16
                     continue
                 }
                 if (subencoding and HEXTILE_BG_SPECIFIED != 0) background = readPixel(inp)
                 if (subencoding and HEXTILE_FG_SPECIFIED != 0) foreground = readPixel(inp)
 
-                val tile = IntArray(tw * th) { background }
+                java.util.Arrays.fill(tile, 0, tw * th, background)
                 if (subencoding and HEXTILE_ANY_SUBRECTS != 0) {
                     val count = inp.readUnsignedByte()
                     val colored = subencoding and HEXTILE_SUBRECTS_COLOURED != 0
@@ -386,45 +435,55 @@ class RfbClient(
                         val sy = xy and 0x0F
                         val sw = (wh shr 4) + 1
                         val sh = (wh and 0x0F) + 1
-                        for (row in sy until minOf(sy + sh, th)) {
-                            val base = row * tw
-                            for (col in sx until minOf(sx + sw, tw)) tile[base + col] = color
-                        }
+                        fillRect(tile, tw, sx, sy, sw, sh, color, tw, th)
                     }
                 }
-                blit(tile, x + tx, y + ty, tw, th)
+                copyTile(tile, tw, buf, w, tx, ty, tw, th)
                 tx += 16
             }
             ty += 16
+        }
+        blit(buf, x, y, w, h)
+    }
+
+    private fun copyTile(tile: IntArray, tileStride: Int, dest: IntArray, destStride: Int, tx: Int, ty: Int, tw: Int, th: Int) {
+        for (row in 0 until th) {
+            System.arraycopy(tile, row * tileStride, dest, (ty + row) * destStride + tx, tw)
         }
     }
 
     // ------------------------------------------------------------------ input
 
-    fun sendPointer(x: Int, y: Int, buttonMask: Int) {
-        val out = output ?: return
-        runCatching {
-            synchronized(out) {
-                out.writeByte(5)
-                out.writeByte(buttonMask)
-                out.writeShort(x.coerceIn(0, (width - 1).coerceAtLeast(0)))
-                out.writeShort(y.coerceIn(0, (height - 1).coerceAtLeast(0)))
-                out.flush()
-            }
-        }
+    private fun putShort(buf: ByteArray, offset: Int, value: Int) {
+        buf[offset] = ((value shr 8) and 0xFF).toByte()
+        buf[offset + 1] = (value and 0xFF).toByte()
+    }
+
+    /**
+     * @param motion true for a plain move, which may replace an unsent move. Button
+     *   changes are never collapsed, or a click would be lost.
+     */
+    fun sendPointer(x: Int, y: Int, buttonMask: Int, motion: Boolean = true) {
+        if (!running) return
+        val msg = ByteArray(6)
+        msg[0] = 5
+        msg[1] = buttonMask.toByte()
+        putShort(msg, 2, x.coerceIn(0, (width - 1).coerceAtLeast(0)))
+        putShort(msg, 4, y.coerceIn(0, (height - 1).coerceAtLeast(0)))
+        outbox.offer(msg, motion)
     }
 
     fun sendKey(keysym: Int, down: Boolean) {
-        val out = output ?: return
-        runCatching {
-            synchronized(out) {
-                out.writeByte(4)
-                out.writeByte(if (down) 1 else 0)
-                out.writeShort(0)
-                out.writeInt(keysym)
-                out.flush()
-            }
-        }
+        if (!running) return
+        val msg = ByteArray(8)
+        msg[0] = 4
+        msg[1] = if (down) 1 else 0
+        putShort(msg, 2, 0)
+        msg[4] = ((keysym shr 24) and 0xFF).toByte()
+        msg[5] = ((keysym shr 16) and 0xFF).toByte()
+        msg[6] = ((keysym shr 8) and 0xFF).toByte()
+        msg[7] = (keysym and 0xFF).toByte()
+        outbox.offer(msg, motion = false)
     }
 
     fun typeKey(keysym: Int) {
@@ -434,6 +493,73 @@ class RfbClient(
 
     fun typeText(text: String) {
         text.forEach { ch -> typeKey(Keysyms.forChar(ch)) }
+    }
+
+    /** A wheel notch: buttons 4 and 5 are scroll up and down. */
+    fun sendScroll(x: Int, y: Int, up: Boolean) {
+        val bit = if (up) 1 shl 3 else 1 shl 4
+        sendPointer(x, y, bit, motion = false)
+        sendPointer(x, y, 0, motion = false)
+    }
+
+    /**
+     * An ordered outbox with one special rule: a pointer move may overwrite the move
+     * immediately in front of it, so a fast drag sends current positions instead of a
+     * backlog of stale ones.
+     */
+    private class Outbox {
+        private class Msg(val bytes: ByteArray, val motion: Boolean)
+
+        private val lock = Object()
+        private val queue = ArrayDeque<Msg>()
+        private var closed = false
+
+        fun offer(bytes: ByteArray, motion: Boolean) {
+            synchronized(lock) {
+                if (closed) return
+                if (motion && queue.lastOrNull()?.motion == true) queue.removeLast()
+                if (queue.size >= MAX_PENDING) {
+                    // Shed a stale move rather than the head of the queue: dropping a
+                    // framebuffer request would stall rendering for good, and dropping a
+                    // button release would leave a button stuck down.
+                    val stale = queue.indexOfFirst { it.motion }
+                    if (stale >= 0) queue.removeAt(stale) else queue.removeFirst()
+                }
+                queue.addLast(Msg(bytes, motion))
+                lock.notifyAll()
+            }
+        }
+
+        /** Blocks until a message is available; null once closed. */
+        fun take(): ByteArray? {
+            synchronized(lock) {
+                while (queue.isEmpty() && !closed) {
+                    try {
+                        lock.wait()
+                    } catch (e: InterruptedException) {
+                        return null
+                    }
+                }
+                if (queue.isEmpty()) return null
+                return queue.removeFirst().bytes
+            }
+        }
+
+        fun poll(): ByteArray? = synchronized(lock) {
+            if (queue.isEmpty()) null else queue.removeFirst().bytes
+        }
+
+        fun close() {
+            synchronized(lock) {
+                closed = true
+                queue.clear()
+                lock.notifyAll()
+            }
+        }
+
+        private companion object {
+            const val MAX_PENDING = 512
+        }
     }
 
     companion object {

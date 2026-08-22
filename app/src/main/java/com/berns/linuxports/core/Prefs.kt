@@ -29,6 +29,15 @@ class Prefs(context: Context) {
 
     fun setDpi(distro: Distro, value: Int) = sp.edit().putInt("dpi_${distro.key}", value).apply()
 
+    /** How touches drive the remote pointer: "trackpad", "direct" or "joystick". */
+    fun pointerMode(): String = sp.getString("pointer_mode", "trackpad")!!
+
+    fun setPointerMode(value: String) = sp.edit().putString("pointer_mode", value).apply()
+
+    fun pointerSpeed(): Float = sp.getFloat("pointer_speed", 1.4f)
+
+    fun setPointerSpeed(value: Float) = sp.edit().putFloat("pointer_speed", value).apply()
+
     fun display(distro: Distro): Int = when (distro.key) {
         "mint" -> 1
         "ubuntu" -> 2
@@ -39,5 +48,7 @@ class Prefs(context: Context) {
         val GEOMETRIES = listOf(
             "1024x600", "1280x720", "1366x768", "1600x900", "1920x1080"
         )
+
+        val POINTER_SPEEDS = listOf(0.8f, 1.4f, 2.2f)
     }
 }

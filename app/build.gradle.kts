@@ -8,6 +8,22 @@ android {
     namespace = "com.berns.linuxports"
     compileSdk = 35
 
+    signingConfigs {
+        // Pinned so every build - here, on another machine, or in CI - produces an APK
+        // that installs *over* an existing one instead of being refused as a different
+        // app. That matters more than usual here: a reinstall would wipe the container
+        // and mean downloading and rebuilding the whole distro again.
+        //
+        // This is the standard Android debug keystore with its published password. It is
+        // not a secret and must never be used to sign a release build.
+        getByName("debug") {
+            storeFile = rootProject.file("keystore/berns-debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     defaultConfig {
         applicationId = "com.berns.linuxports"
         minSdk = 26
