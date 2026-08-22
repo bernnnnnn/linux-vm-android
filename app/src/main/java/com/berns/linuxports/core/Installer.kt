@@ -131,6 +131,60 @@ class Installer(private val context: Context) {
         deleteRecursively(paths.distroDir(distro))
     }
 
+    /**
+     * Re-runs the maintenance script against a container that is already installed.
+     *
+     * Setup scripts only run once, at install time, so a fix shipped in a later version of
+     * the app would otherwise never reach an existing container - and reinstalling means
+     * downloading and rebuilding the whole distribution again.
+     */
+    suspend fun repair(
+        distro: Distro,
+        vncPassword: String,
+        onProgress: (InstallProgress) -> Unit,
+        onLog: (String) -> Unit
+    ) = withContext(Dispatchers.IO) {
+        try {
+            onProgress(InstallProgress(Phase.PREPARING, "Checking the container"))
+            val rootfs = paths.rootfs(distro)
+            if (!paths.isInstalled(distro) || !File(rootfs, "etc").isDirectory) {
+                throw InstallException("${distro.displayName} is not installed.")
+            }
+            proot.ensureShims()
+
+            context.assets.open("setup/common.sh").use { input ->
+                File(rootfs, "root/berns-common.sh").outputStream().use { input.copyTo(it) }
+            }
+            context.assets.open("setup/repair.sh").use { input ->
+                File(rootfs, "root/berns-repair.sh").outputStream().use { input.copyTo(it) }
+            }
+            File(rootfs, "root/berns-repair.sh").setExecutable(true, false)
+            // DNS can go stale when the phone changes network between sessions.
+            File(rootfs, "etc/resolv.conf")
+                .writeText(dnsServers().joinToString("\n", postfix = "\n") { "nameserver $it" })
+
+            onProgress(InstallProgress(Phase.SETUP, "Updating ${distro.name} - this takes a few minutes"))
+            val log = paths.logFile(distro)
+            val exit = ContainerRunner(context).runToLog(
+                distro = distro,
+                command = listOf("/bin/bash", "/root/berns-repair.sh"),
+                extraEnv = mapOf(
+                    "BERNS_USER" to CONTAINER_USER,
+                    "BERNS_VNC_PASS" to vncPassword
+                )
+            ) { line ->
+                log.appendText(line + "\n")
+                onLog(line)
+            }
+            if (exit != 0) throw InstallException("The update script exited with code $exit.")
+            onProgress(InstallProgress(Phase.DONE, "${distro.displayName} is up to date", 1f))
+        } catch (e: Throwable) {
+            onLog("FAILED: ${e.message}")
+            onProgress(InstallProgress(Phase.FAILED, e.message ?: "Update failed"))
+            throw e
+        }
+    }
+
     // ---------------------------------------------------------------- download
 
     private suspend fun fetchExpectedSha256(distro: Distro, fileName: String, onLog: (String) -> Unit): String? =

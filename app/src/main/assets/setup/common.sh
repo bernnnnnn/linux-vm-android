@@ -49,7 +49,31 @@ path-exclude=/usr/share/man/*
 path-exclude=/usr/share/groff/*
 path-exclude=/usr/share/info/*
 EOF
+    neutralise_init
     apt_get update || die "apt-get update failed - check the network and try again"
+}
+
+# Nothing in the container runs services - there is no init - and systemd's maintainer
+# scripts abort under proot's ptrace sandbox. A failed postinst leaves dpkg half
+# configured, which then blocks every later install, so the pieces those scripts reach for
+# are stubbed out and packages are told not to start anything. Idempotent: safe to re-run
+# over a container that already exists.
+neutralise_init() {
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+    chmod +x /usr/sbin/policy-rc.d
+
+    if [ ! -s /etc/machine-id ]; then
+        (cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N) | tr -d '-\n' > /etc/machine-id
+    fi
+
+    local tool
+    for tool in systemctl systemd-sysusers systemd-tmpfiles systemd-machine-id-setup \
+                systemd-detect-virt systemd-hwdb udevadm; do
+        if [ ! -L "/usr/bin/$tool" ]; then
+            dpkg-divert --local --rename --add "/usr/bin/$tool" >/dev/null 2>&1
+            ln -sf /bin/true "/usr/bin/$tool"
+        fi
+    done
 }
 
 install_base() {
@@ -68,8 +92,143 @@ install_desktop() {
         fonts-dejavu-core fonts-liberation2 \
         librsvg2-common gtk2-engines-murrine
     install_optional mousepad ristretto xarchiver galculator \
-        xfce4-notifyd xfce4-screenshooter thunar-archive-plugin \
-        epiphany-browser
+        xfce4-notifyd xfce4-screenshooter thunar-archive-plugin
+}
+
+# Ubuntu ships Firefox only as a snap, and snapd needs systemd and mount namespaces that a
+# container has no way to provide. Mozilla publishes genuine .deb builds for arm64 and
+# amd64, so the browser comes from there.
+#
+# Chromium is snap-only too, and everything built on WebKitGTK (Epiphany, Midori) launches
+# its renderer through bubblewrap, which needs user namespaces proot cannot grant - those
+# fail with "Input/output error" no matter how they are installed.
+MOZILLA_REPO="https://packages.mozilla.org/apt"
+
+install_browser() {
+    step "Installing the web browser"
+    local update_log="/tmp/berns-apt-mozilla.log"
+
+    # Ubuntu's "firefox" package is a stub that installs the snap, and it depends on snapd
+    # and systemd. systemd's post-install aborts inside a container and leaves dpkg
+    # half-configured, which then blocks every later install. Make that stub uninstallable
+    # before apt is given any chance to reach for it.
+    cat > /etc/apt/preferences.d/berns-firefox <<'EOF'
+Package: firefox firefox-* snapd
+Pin: release o=Ubuntu
+Pin-Priority: -1
+
+Package: *
+Pin: origin packages.mozilla.org
+Pin-Priority: 1000
+EOF
+
+    install -d -m 0755 /etc/apt/keyrings
+    if curl -fsSL "$MOZILLA_REPO/repo-signing-key.gpg" \
+            | gpg --dearmor > /etc/apt/keyrings/packages.mozilla.org.gpg 2>/dev/null \
+            && [ -s /etc/apt/keyrings/packages.mozilla.org.gpg ]; then
+        echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.gpg] $MOZILLA_REPO mozilla main" \
+            > /etc/apt/sources.list.d/mozilla.list
+    else
+        warn "could not fetch Mozilla's signing key"
+    fi
+
+    apt_get update > "$update_log" 2>&1 || true
+    if grep -qE 'NO_PUBKEY|is not signed' "$update_log"; then
+        warn "Mozilla's repository did not verify; fetching the package directly instead"
+        rm -f /etc/apt/sources.list.d/mozilla.list
+        apt_get update >/dev/null 2>&1 || true
+    else
+        apt_get install -y --no-install-recommends firefox >/dev/null 2>&1 || true
+    fi
+
+    browser_works || install_firefox_deb || true
+
+    if ! browser_works; then
+        warn "no working web browser could be installed"
+        return 1
+    fi
+    info "installed $(firefox --version 2>/dev/null | head -1)"
+    set_default_browser
+}
+
+# A binary on PATH is not proof of a working browser: a package that unpacked but never
+# configured leaves the executable in place with its libraries missing.
+browser_works() {
+    command -v firefox >/dev/null 2>&1 && firefox --version >/dev/null 2>&1
+}
+
+# Fallback when the apt signature chain is unavailable: resolve the package through
+# Mozilla's own index over HTTPS and check the .deb against the SHA-256 recorded there.
+install_firefox_deb() {
+    local arch index path sha deb
+    arch="$(dpkg --print-architecture)"
+    index="/tmp/berns-mozilla-$arch.txt"
+    curl -fsSL "$MOZILLA_REPO/dists/mozilla/main/binary-$arch/Packages" -o "$index" || return 1
+
+    path="$(awk '/^Package: firefox$/ {f=1} f && /^Filename: / {print $2; exit}' "$index")"
+    sha="$(awk '/^Package: firefox$/ {f=1} f && /^SHA256: / {print $2; exit}' "$index")"
+    [ -n "$path" ] || { warn "firefox is not listed for $arch"; return 1; }
+
+    deb="/tmp/firefox_${arch}.deb"
+    info "fetching firefox for $arch"
+    curl -fsSL "$MOZILLA_REPO/$path" -o "$deb" || return 1
+    if [ -n "$sha" ] && ! echo "$sha  $deb" | sha256sum -c - >/dev/null 2>&1; then
+        warn "the downloaded firefox package failed its checksum"
+        rm -f "$deb"
+        return 1
+    fi
+
+    # Installed through apt rather than dpkg so the GTK stack the browser links against
+    # comes with it. "dpkg -i" on its own leaves the package unpacked and unusable.
+    apt_get install -y --no-install-recommends "$deb" >/dev/null 2>&1 || \
+        apt_get -f install -y >/dev/null 2>&1 || true
+    rm -f "$deb" "$index"
+    browser_works
+}
+
+# Xfce asks exo which browser to launch, and exo answers from a helper definition rather
+# than from the freedesktop defaults. Without one it reports "Failed to execute default
+# Web Browser", which is what an unconfigured container does.
+set_default_browser() {
+    local bin path home
+    bin=firefox
+    path="$(command -v "$bin")"
+    home="/home/$BERNS_USER"
+
+    update-alternatives --install /usr/bin/x-www-browser x-www-browser "$path" 200 >/dev/null 2>&1
+    update-alternatives --set x-www-browser "$path" >/dev/null 2>&1
+    update-alternatives --install /usr/bin/gnome-www-browser gnome-www-browser "$path" 200 >/dev/null 2>&1
+
+    mkdir -p /usr/share/xfce4/helpers
+    cat > /usr/share/xfce4/helpers/berns-browser.desktop <<EOF
+[Desktop Entry]
+Version=1.0
+Encoding=UTF-8
+Type=X-XFCE-Helper
+X-XFCE-Category=WebBrowser
+X-XFCE-CommandsWithParameter=$path "%s"
+X-XFCE-Commands=$path
+Icon=$bin
+Name=Firefox
+StartupNotify=false
+EOF
+
+    mkdir -p "$home/.config/xfce4"
+    if [ -f "$home/.config/xfce4/helpers.rc" ] && grep -q '^WebBrowser=' "$home/.config/xfce4/helpers.rc"; then
+        sed -i 's|^WebBrowser=.*|WebBrowser=berns-browser|' "$home/.config/xfce4/helpers.rc"
+    else
+        echo "WebBrowser=berns-browser" >> "$home/.config/xfce4/helpers.rc"
+    fi
+
+    cat > "$home/.config/mimeapps.list" <<'EOF'
+[Default Applications]
+text/html=firefox.desktop
+x-scheme-handler/http=firefox.desktop
+x-scheme-handler/https=firefox.desktop
+x-scheme-handler/about=firefox.desktop
+EOF
+    chown -R "$BERNS_USER:$BERNS_USER" "$home/.config"
+    info "set Firefox as the default browser"
 }
 
 install_vnc() {

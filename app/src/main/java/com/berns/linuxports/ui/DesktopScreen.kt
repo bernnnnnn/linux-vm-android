@@ -1,5 +1,6 @@
 package com.berns.linuxports.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -45,12 +46,18 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
@@ -94,6 +101,9 @@ private const val BUTTON_RIGHT = 4
 
 @Composable
 fun DesktopScreen(distro: Distro, viewModel: AppViewModel, onBack: () -> Unit) {
+    // Without this, the system back gesture leaves the app entirely instead of
+    // returning to the port's page.
+    BackHandler(onBack = onBack)
     val context = LocalContext.current
     val keyboard = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
@@ -114,6 +124,19 @@ fun DesktopScreen(distro: Distro, viewModel: AppViewModel, onBack: () -> Unit) {
     var client by remember { mutableStateOf<RfbClient?>(null) }
     var mode by remember { mutableStateOf(PointerMode.from(prefs.pointerMode())) }
     var speed by remember { mutableStateOf(prefs.pointerSpeed()) }
+    var keyboardOpen by remember { mutableStateOf(false) }
+
+    // Focus has to land on the hidden field before the IME will come up, so the two are
+    // driven from one flag rather than from whichever button was tapped.
+    LaunchedEffect(keyboardOpen) {
+        if (keyboardOpen) {
+            runCatching { focusRequester.requestFocus() }
+            delay(60)
+            keyboard?.show()
+        } else {
+            keyboard?.hide()
+        }
+    }
 
     LaunchedEffect(distro.key) { VmService.start(context, "${distro.name} desktop") }
 
@@ -148,10 +171,7 @@ fun DesktopScreen(distro: Distro, viewModel: AppViewModel, onBack: () -> Unit) {
                     prefs.setPointerSpeed(it)
                 },
                 onBack = onBack,
-                onKeyboard = {
-                    focusRequester.requestFocus()
-                    keyboard?.show()
-                },
+                onKeyboard = { keyboardOpen = !keyboardOpen },
                 onStop = {
                     active?.disconnect()
                     SessionManager.stopDesktop(distro)
@@ -167,8 +187,18 @@ fun DesktopScreen(distro: Distro, viewModel: AppViewModel, onBack: () -> Unit) {
                 if (active != null) {
                     val input = remember(active) { RemoteInput(active) }
                     RemoteScreen(active, input, mode, speed)
-                    HiddenKeyInput(focusRequester) { text -> active.typeText(text) }
-                    ControlBar(active, input, Modifier.align(Alignment.BottomCenter))
+                    HiddenKeyInput(
+                        focusRequester = focusRequester,
+                        onText = { text -> active.typeText(text) },
+                        onKeysym = { keysym -> active.typeKey(keysym) }
+                    )
+                    ControlBar(
+                        client = active,
+                        input = input,
+                        keyboardOpen = keyboardOpen,
+                        onKeyboard = { keyboardOpen = !keyboardOpen },
+                        modifier = Modifier.align(Alignment.BottomCenter)
+                    )
                 } else {
                     Starting(state, log)
                 }
@@ -373,6 +403,9 @@ private fun RemoteScreen(client: RfbClient, input: RemoteInput, mode: PointerMod
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
+                // Compose does not clip a Canvas to its own bounds, so without this the
+                // background fill below spills over the toolbar drawn above it.
+                .clipToBounds()
                 .onSizeChanged { viewport = it }
                 .pointerInput(client, mode, speed, size) {
                     val slop = viewConfiguration.touchSlop
@@ -478,11 +511,13 @@ private fun RemoteScreen(client: RfbClient, input: RemoteInput, mode: PointerMod
                     }
                 }
         ) {
+            // Painting the background as a rect keeps it inside this node; drawColor()
+            // would fill the whole clip region, toolbar included.
+            drawRect(Color(0xFF05080A))
             if (scale <= 0f) return@Canvas
+            if (frame < 0L) return@Canvas // reads frame so a new one triggers a redraw
             drawIntoCanvas { canvas ->
                 val native = canvas.nativeCanvas
-                native.drawColor(0xFF05080A.toInt())
-                val ignored = frame
                 client.withBitmap { bitmap ->
                     native.save()
                     native.translate(offset.x, offset.y)
@@ -490,7 +525,6 @@ private fun RemoteScreen(client: RfbClient, input: RemoteInput, mode: PointerMod
                     native.drawBitmap(bitmap, 0f, 0f, null)
                     native.restore()
                 }
-                if (ignored < 0) native.drawColor(0)
             }
         }
 
@@ -564,7 +598,13 @@ private fun Joystick(modifier: Modifier = Modifier, onDirection: (Offset) -> Uni
 
 /** Mouse buttons, scroll and a latching drag, which touch alone cannot express. */
 @Composable
-private fun ControlBar(client: RfbClient, input: RemoteInput, modifier: Modifier = Modifier) {
+private fun ControlBar(
+    client: RfbClient,
+    input: RemoteInput,
+    keyboardOpen: Boolean,
+    onKeyboard: () -> Unit,
+    modifier: Modifier = Modifier
+) {
     val scroll = rememberScrollState()
     var ctrl by remember { mutableStateOf(false) }
     var alt by remember { mutableStateOf(false) }
@@ -589,6 +629,7 @@ private fun ControlBar(client: RfbClient, input: RemoteInput, modifier: Modifier
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        DeskKey("KEYS", keyboardOpen, onKeyboard)
         DeskKey("LEFT") { withModifiers { input.click(BUTTON_LEFT) } }
         DeskKey("RIGHT") { input.click(BUTTON_RIGHT) }
         DeskKey("MID") { input.click(BUTTON_MIDDLE) }
@@ -636,7 +677,11 @@ private fun DeskKey(label: String, active: Boolean = false, onClick: () -> Unit)
 }
 
 @Composable
-private fun HiddenKeyInput(focusRequester: FocusRequester, onText: (String) -> Unit) {
+private fun HiddenKeyInput(
+    focusRequester: FocusRequester,
+    onText: (String) -> Unit,
+    onKeysym: (Int) -> Unit
+) {
     var value by remember { mutableStateOf(TextFieldValue("")) }
     BasicTextField(
         value = value,
@@ -647,7 +692,34 @@ private fun HiddenKeyInput(focusRequester: FocusRequester, onText: (String) -> U
         modifier = Modifier
             .size(1.dp)
             .alpha(0f)
-            .focusRequester(focusRequester),
+            .focusRequester(focusRequester)
+            // The field is kept empty, so a soft-keyboard backspace produces no text
+            // change to react to. These arrive as key events instead.
+            .onPreviewKeyEvent { event ->
+                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                val keysym = when (event.key) {
+                    Key.Backspace -> Keysyms.BACKSPACE
+                    Key.Enter, Key.NumPadEnter -> Keysyms.RETURN
+                    Key.Tab -> Keysyms.TAB
+                    Key.Escape -> Keysyms.ESCAPE
+                    Key.DirectionUp -> Keysyms.UP
+                    Key.DirectionDown -> Keysyms.DOWN
+                    Key.DirectionLeft -> Keysyms.LEFT
+                    Key.DirectionRight -> Keysyms.RIGHT
+                    Key.MoveHome -> Keysyms.HOME
+                    Key.MoveEnd -> Keysyms.END
+                    Key.PageUp -> Keysyms.PAGE_UP
+                    Key.PageDown -> Keysyms.PAGE_DOWN
+                    Key.Delete -> Keysyms.DELETE
+                    else -> null
+                }
+                if (keysym != null) {
+                    onKeysym(keysym)
+                    true
+                } else {
+                    false
+                }
+            },
         keyboardOptions = KeyboardOptions(
             capitalization = KeyboardCapitalization.None,
             autoCorrectEnabled = false,

@@ -1,5 +1,6 @@
 package com.berns.linuxports.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -66,6 +67,8 @@ fun DistroScreen(
     onOpenTerminal: () -> Unit,
     onOpenDesktop: () -> Unit
 ) {
+    BackHandler(onBack = onBack)
+
     val installedKeys by viewModel.installed.collectAsState()
     val progressMap by viewModel.progress.collectAsState()
     val logMap by viewModel.logs.collectAsState()
@@ -136,6 +139,7 @@ fun DistroScreen(
                     prefs = viewModel.prefs,
                     onOpenDesktop = onOpenDesktop,
                     onOpenTerminal = onOpenTerminal,
+                    onRepair = { viewModel.repair(distro) },
                     onRemove = { confirmRemove = true }
                 )
 
@@ -246,6 +250,7 @@ private fun ReadyCard(
     prefs: Prefs,
     onOpenDesktop: () -> Unit,
     onOpenTerminal: () -> Unit,
+    onRepair: () -> Unit,
     onRemove: () -> Unit
 ) {
     val running = SessionManager.active.collectAsState().value.contains(distro.key)
@@ -319,6 +324,19 @@ private fun ReadyCard(
                 fontFamily = FontFamily.Monospace,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
             )
+            Spacer(Modifier.height(16.dp))
+            Text(
+                "Bring this container up to date with the current version of the app - " +
+                    "installs the web browser and re-applies the desktop setup. Keeps " +
+                    "everything you already have.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(onClick = onRepair, modifier = Modifier.fillMaxWidth()) {
+                Text("Update container")
+            }
+
             Spacer(Modifier.height(14.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 if (running) {

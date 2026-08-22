@@ -68,6 +68,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Applies the current version's setup fixes to an already-installed container. */
+    fun repair(distro: Distro) {
+        if (jobs[distro.key]?.isActive == true) return
+        _logs.value = _logs.value + (distro.key to emptyList())
+        SessionManager.stopAll(distro)
+        jobs[distro.key] = viewModelScope.launch {
+            runCatching {
+                installer.repair(
+                    distro = distro,
+                    vncPassword = prefs.vncPassword(distro),
+                    onProgress = { p -> _progress.value = _progress.value + (distro.key to p) },
+                    onLog = { line -> appendLog(distro, line) }
+                )
+            }
+            refreshInstalled()
+        }
+    }
+
     fun cancelInstall(distro: Distro) {
         jobs[distro.key]?.cancel()
         jobs.remove(distro.key)

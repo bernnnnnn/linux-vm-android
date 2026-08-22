@@ -2,6 +2,7 @@ package com.berns.linuxports.ui
 
 import android.graphics.Paint
 import android.graphics.Typeface
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -38,6 +39,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
@@ -73,6 +75,9 @@ private const val ACCENT = 0xFF7FD1B9.toInt()
 
 @Composable
 fun TerminalScreen(distro: Distro, onBack: () -> Unit) {
+    // Without this, the system back gesture leaves the app entirely instead of
+    // returning to the port's page.
+    BackHandler(onBack = onBack)
     val context = LocalContext.current
     val density = LocalDensity.current
     val keyboard = LocalSoftwareKeyboardController.current
@@ -161,6 +166,9 @@ fun TerminalScreen(distro: Distro, onBack: () -> Unit) {
                 Canvas(
                     modifier = Modifier
                         .fillMaxSize()
+                        // Without this the background fill below escapes the node and
+                        // paints over the bar above it - Compose does not clip a Canvas.
+                        .clipToBounds()
                         .pointerInput(Unit) {
                             detectTapGestures {
                                 focusRequester.requestFocus()
@@ -169,9 +177,9 @@ fun TerminalScreen(distro: Distro, onBack: () -> Unit) {
                         }
                 ) {
                     val active = session
+                    drawRect(Color(BACKGROUND))
                     drawIntoCanvas { canvas ->
                         val native = canvas.nativeCanvas
-                        native.drawColor(BACKGROUND)
                         if (active == null) return@drawIntoCanvas
                         val emu = active.emulator
                         // revision is read so Compose redraws when new output arrives
@@ -227,7 +235,7 @@ fun TerminalScreen(distro: Distro, onBack: () -> Unit) {
                                     paint
                                 )
                             }
-                            if (ignored < 0) native.drawColor(BACKGROUND)
+                            if (ignored < 0) return@synchronized
                         }
                     }
                 }

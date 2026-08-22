@@ -9,6 +9,7 @@ prepare_apt
 install_base
 install_desktop
 install_vnc
+install_browser || warn "continuing without a web browser"
 create_user
 
 step "Installing the Mint artwork"

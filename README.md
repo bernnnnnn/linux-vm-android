@@ -117,6 +117,9 @@ for a release build.
    The bar along the bottom has the mouse buttons, a latching **DRAG** toggle for moving
    windows, scroll, and Ctrl/Alt/Esc/Tab/arrows.
 4. **Open terminal** gives you `bash` as the `berns` user, with passwordless `sudo`.
+5. **Update container** on the port's page re-applies the current version's setup to a
+   container you already installed — it is how a fix reaches an existing install without
+   costing you the whole download again.
 
 Files in `/mnt/android` inside the container are shared with the app's own storage, so it's
 the place to move things in and out.
@@ -171,6 +174,37 @@ package is named after an older release than the suite serving it.
 the `jniLibs` exec path, the JNI pty and the Compose UI were all built against the
 documented behaviour but never executed on a phone. Expect the first run on real hardware
 to need a fix or two — that is where the remaining risk lives.
+
+## The web browser
+
+Ubuntu ships Firefox only as a snap, and snapd needs systemd and mount namespaces a
+container cannot provide. Worse, Ubuntu's `firefox` package is a stub that pulls in snapd
+and systemd, and systemd's post-install aborts under proot and leaves `dpkg` half
+configured — which then blocks every later install. The setup pins that stub to
+`Pin-Priority: -1` so apt can never reach for it.
+
+The browser therefore comes from **Mozilla's own apt repository**, which publishes genuine
+`.deb` builds for arm64 and amd64, verified through their signing key. If that signature
+chain cannot be established, the setup falls back to fetching the package straight from
+Mozilla's index over HTTPS and checking it against the SHA-256 recorded there, rather than
+silently installing nothing.
+
+Chromium is snap-only on Ubuntu too. Anything built on WebKitGTK — Epiphany, Midori —
+launches its renderer through bubblewrap, which needs user namespaces proot cannot grant;
+those fail with `Input/output error` however they are installed. Firefox is the one that
+works.
+
+## Why the container has no init
+
+There is no systemd inside a port, and packages are told so explicitly. `policy-rc.d`
+refuses every service start, and the handful of tools systemd's maintainer scripts reach
+for (`systemctl`, `systemd-sysusers`, `systemd-tmpfiles`, `udevadm`) are diverted to
+`/bin/true`.
+
+That is not tidiness. Those scripts abort under proot's ptrace sandbox, and a failed
+`postinst` leaves `dpkg` half configured — which silently blocks every install after it.
+The symptom is a package that appears to install and then does not work, which is exactly
+how the missing browser presented.
 
 ## Known limits
 
