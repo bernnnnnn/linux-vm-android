@@ -148,6 +148,7 @@ EOF
         return 1
     fi
     info "installed $(firefox --version 2>/dev/null | head -1)"
+    harden_browser
     set_default_browser
 }
 
@@ -184,6 +185,109 @@ install_firefox_deb() {
         apt_get -f install -y >/dev/null 2>&1 || true
     rm -f "$deb" "$index"
     browser_works
+}
+
+# Firefox renders pages in content processes that install a seccomp-bpf filter. proot
+# intercepts syscalls with ptrace, and the two collide: the content process is killed and
+# the browser reports "Gah. Your tab just crashed." on every page it opens.
+#
+# There are no user namespaces in here to sandbox with in the first place - that is the
+# same limitation that rules WebKitGTK out entirely - so the content sandbox is switched
+# off. The container is the boundary; the browser is not being asked to be one too.
+harden_browser() {
+    local real installdir prefdir desktop candidate
+
+    # command -v is the reliable answer here; readlink and test -x can both misreport
+    # inside the sandbox, and an early return would leave the browser unconfigured.
+    real="$(command -v firefox 2>/dev/null || true)"
+    case "$real" in /usr/local/bin/*) real="" ;; esac
+
+    installdir=""
+    for candidate in /usr/lib/firefox /opt/firefox /usr/lib64/firefox; do
+        if [ -e "$candidate/firefox" ]; then
+            installdir="$candidate"
+            break
+        fi
+    done
+    [ -n "$installdir" ] && real="$installdir/firefox"
+    if [ -z "$real" ]; then
+        warn "cannot locate the firefox binary to configure"
+        return 1
+    fi
+    [ -n "$installdir" ] || installdir="$(dirname "$real")"
+
+    # A system pref applies however Firefox is started, including from the applications
+    # menu, which goes through no wrapper of ours.
+    prefdir="$installdir/browser/defaults/preferences"
+    mkdir -p "$prefdir"
+    cat > "$prefdir/berns.js" <<'EOF'
+// Berns Linux Ports: proot gives no user namespaces, so the content sandbox cannot work
+// and its failure takes every tab with it. The container is the security boundary here.
+pref("security.sandbox.content.level", 0);
+
+// A phone has far less memory than these defaults assume, and every content process is
+// another copy of the engine. One is enough here.
+pref("dom.ipc.processCount", 1);
+pref("browser.tabs.remote.autostart", true);
+
+// The X server behind this desktop is a software framebuffer with no GL at all. Asking
+// for acceleration gets a GPU process that fails, and it takes tabs down with it.
+pref("gfx.webrender.software", true);
+pref("gfx.canvas.accelerated", false);
+pref("layers.acceleration.disabled", true);
+pref("media.hardware-video-decoding.enabled", false);
+pref("gfx.x11-egl.force-disabled", true);
+EOF
+
+    cat > /usr/local/bin/firefox <<EOF
+#!/bin/sh
+# Berns Linux Ports launcher - see $prefdir/berns.js
+export MOZ_DISABLE_CONTENT_SANDBOX=1
+export MOZ_ENABLE_WAYLAND=0
+export LIBGL_ALWAYS_SOFTWARE=1
+export MOZ_ACCELERATED=0
+exec $real "\$@"
+EOF
+    chmod +x /usr/local/bin/firefox
+
+    # Menu entries use "Exec=firefox", which finds the wrapper through PATH, but some use
+    # an absolute path. Rewrite those so every launch route agrees.
+    for desktop in /usr/share/applications/firefox.desktop \
+                   /usr/local/share/applications/firefox.desktop; do
+        [ -f "$desktop" ] || continue
+        sed -i -E 's|^Exec=(/usr/bin/firefox\|/usr/lib/firefox/firefox\|/opt/firefox/firefox)|Exec=/usr/local/bin/firefox|' "$desktop"
+    done
+    update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+
+    install_browser_check
+    info "configured firefox for a software-rendered container"
+}
+
+# A one-command answer to "why did my tab crash", runnable from the app's terminal.
+install_browser_check() {
+    cat > /usr/local/bin/berns-browser-check <<'EOF'
+#!/bin/sh
+# Renders a local page in a real content process and reports what happened.
+echo "berns browser check"
+echo "-------------------"
+command -v firefox >/dev/null 2>&1 || { echo "firefox: NOT INSTALLED"; exit 1; }
+echo "version: $(firefox --version 2>&1 | head -1)"
+cat > /tmp/berns-probe.html <<'HTML'
+<html><body><h1>probe</h1></body></html>
+HTML
+rm -f /tmp/berns-probe.png
+timeout 120 firefox --headless --screenshot /tmp/berns-probe.png     file:///tmp/berns-probe.html > /tmp/berns-probe.log 2>&1
+status=$?
+if [ -s /tmp/berns-probe.png ]; then
+    echo "render: OK ($(wc -c < /tmp/berns-probe.png) bytes) - content processes work"
+else
+    echo "render: FAILED (exit $status) - this is the tab crash"
+    echo "--- last 20 lines ---"
+    tail -20 /tmp/berns-probe.log
+fi
+echo "memory: $(free -m 2>/dev/null | awk '/^Mem:/{print $2" MB total, "$7" MB available"}')"
+EOF
+    chmod +x /usr/local/bin/berns-browser-check
 }
 
 # Xfce asks exo which browser to launch, and exo answers from a helper definition rather

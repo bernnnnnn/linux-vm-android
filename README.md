@@ -189,6 +189,16 @@ chain cannot be established, the setup falls back to fetching the package straig
 Mozilla's index over HTTPS and checking it against the SHA-256 recorded there, rather than
 silently installing nothing.
 
+Firefox is then configured for what a container actually is: the content sandbox is turned
+off (there are no user namespaces to build one from, and its failure kills every tab), it
+runs a single content process because a phone has nowhere near the memory these defaults
+assume, and rendering is forced to software because the X server behind the desktop is a
+framebuffer with no GL at all.
+
+If a page still will not load, `berns-browser-check` in the container's terminal renders a
+local page through a real content process and prints either "render: OK" or the crash
+output and how much memory the container can see.
+
 Chromium is snap-only on Ubuntu too. Anything built on WebKitGTK — Epiphany, Midori —
 launches its renderer through bubblewrap, which needs user namespaces proot cannot grant;
 those fail with `Input/output error` however they are installed. Firefox is the one that
